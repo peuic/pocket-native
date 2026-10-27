@@ -2712,12 +2712,31 @@ enum Attributes {
 #[derive(Default)]
 struct Resident {
     buffers: rustc_hash::FxHashMap<(usize, usize), (glow::Buffer, Arc<[u8]>, u64)>,
+    /// the arrays' cost by resident_cost, not their lengths.
     bytes: usize,
     draws: u64,
 }
 
-/// how many bytes of arrays stay on the GPU before the oldest go.
+/// how many bytes of arrays, each rounded up to whole pages, stay on the
+/// GPU before the oldest go.
 const RESIDENT_BYTES: usize = 64 << 20;
+
+/// how many arrays stay on the GPU before the oldest go: each is a buffer
+/// object the driver keeps pages and bookkeeping for, whatever its size.
+/// Ocarina of Time 3D makes ~85 small ones a second (animated meshes get a
+/// fresh array every frame), which reached some 20,000 buffers and 650 MB in
+/// the driver while this cache counted 26 MB of vertices, until a 1 GB
+/// handheld ran out of memory.
+const MOST_RESIDENT: usize = 2048;
+
+/// the driver's page, which an array takes at least.
+const PAGE: usize = 4096;
+
+/// what an array costs the driver at least, whole pages; the rest of its
+/// overhead per buffer is what MOST_RESIDENT bounds.
+fn resident_cost(len: usize) -> usize {
+    (len + PAGE - 1) & !(PAGE - 1)
+}
 
 impl Resident {
     fn buffer(&mut self, gl: &glow::Context, array: &Arc<[u8]>) -> Result<glow::Buffer, String> {
@@ -2727,23 +2746,21 @@ impl Resident {
             *used = draws;
             return Ok(*buffer);
         }
-        if self.bytes + array.len() > RESIDENT_BYTES {
-            // the arrays no draw used lately go, all of them when that is not
-            // enough
-            let recent = draws.saturating_sub(20_000);
-            let mut gone = Vec::new();
-            self.buffers.retain(|_, (buffer, array, used)| {
-                let keep = *used >= recent;
-                if !keep {
-                    gone.push((*buffer, array.len()));
+        let cost = resident_cost(array.len());
+        if self.bytes + cost > RESIDENT_BYTES || self.buffers.len() >= MOST_RESIDENT {
+            // the least recently used arrays go, down to three quarters of
+            // each limit so the next arrays come in without another pass, but
+            // never one the draw in progress fetched already: it is bound or
+            // about to be, and its draw has not been issued
+            let mut by_age: Vec<(u64, (usize, usize))> = self.buffers.iter().map(|(key, (_, _, used))| (*used, *key)).collect();
+            by_age.sort_unstable();
+            for (used, key) in by_age {
+                let room = self.bytes + cost <= RESIDENT_BYTES / 4 * 3 && self.buffers.len() < MOST_RESIDENT / 4 * 3;
+                if used == draws || room {
+                    break;
                 }
-                keep
-            });
-            if self.bytes + array.len() > RESIDENT_BYTES + gone.iter().map(|(_, len)| len).sum::<usize>() {
-                gone.extend(self.buffers.drain().map(|(_, (buffer, array, _))| (buffer, array.len())));
-            }
-            for (buffer, len) in gone {
-                self.bytes -= len;
+                let (buffer, array, _) = self.buffers.remove(&key).expect("an array just listed");
+                self.bytes -= resident_cost(array.len());
                 // SAFETY: on the GL thread, the draws that read it were issued
                 unsafe { gl.delete_buffer(buffer) };
             }
@@ -2755,7 +2772,7 @@ impl Resident {
             gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, array, glow::STATIC_DRAW);
             buffer
         };
-        self.bytes += array.len();
+        self.bytes += cost;
         self.buffers.insert(key, (buffer, array.clone(), draws));
         Ok(buffer)
     }
