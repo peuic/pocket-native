@@ -2747,23 +2747,19 @@ impl Resident {
             return Ok(*buffer);
         }
         let cost = resident_cost(array.len());
-        if self.bytes + cost > RESIDENT_BYTES || self.buffers.len() >= MOST_RESIDENT {
-            // the least recently used arrays go, down to three quarters of
-            // each limit so the next arrays come in without another pass, but
-            // never one the draw in progress fetched already: it is bound or
-            // about to be, and its draw has not been issued
-            let mut by_age: Vec<(u64, (usize, usize))> = self.buffers.iter().map(|(key, (_, _, used))| (*used, *key)).collect();
-            by_age.sort_unstable();
-            for (used, key) in by_age {
-                let room = self.bytes + cost <= RESIDENT_BYTES / 4 * 3 && self.buffers.len() < MOST_RESIDENT / 4 * 3;
-                if used == draws || room {
-                    break;
-                }
-                let (buffer, array, _) = self.buffers.remove(&key).expect("an array just listed");
-                self.bytes -= resident_cost(array.len());
-                // SAFETY: on the GL thread, the draws that read it were issued
-                unsafe { gl.delete_buffer(buffer) };
-            }
+        // the least recently used arrays go, one for each new one once the
+        // cache is full, so a draw never pays for hundreds of deletions at
+        // once: emptying a quarter of the cache in one go made every game
+        // hitch for a frame each time it filled, every few seconds. never
+        // one the draw in progress fetched already: it is bound or about to
+        // be, and its draw has not been issued
+        while self.bytes + cost > RESIDENT_BYTES || self.buffers.len() >= MOST_RESIDENT {
+            let oldest = self.buffers.iter().filter(|(_, (_, _, used))| *used != draws).min_by_key(|(_, (_, _, used))| *used).map(|(key, _)| *key);
+            let Some(key) = oldest else { break };
+            let (buffer, array, _) = self.buffers.remove(&key).expect("an array just listed");
+            self.bytes -= resident_cost(array.len());
+            // SAFETY: on the GL thread, the draws that read it were issued
+            unsafe { gl.delete_buffer(buffer) };
         }
         // SAFETY: on the GL thread with the context current
         let buffer = unsafe {
