@@ -4333,12 +4333,16 @@ impl Gles {
         let (input_kind, output_kind) = (Kind::Color(t.input_format), Kind::Color(t.output_format));
         let tile_rows = 8 * t.input_width * input_kind.bytes();
         let rows = t.copy.1 * t.scale.1;
-        let Some((addr, size)) = self.surfaces.iter().find_map(|s| {
-            // the rows after the drawing make a tiled surface of their own,
-            // so they too have to be whole rows of tiles
-            let fits = s.addr == t.input && s.kind == input_kind && s.tiled && s.width == t.input_width && s.dirty.is_some() && s.height < rows && rows.is_multiple_of(8) && s.height.is_multiple_of(8) && s.height.is_multiple_of(t.scale.1);
-            fits.then_some((s.addr, (s.width, s.height)))
-        }) else {
+        // the rows after the drawing make a tiled surface of their own, so
+        // they too have to be whole rows of tiles; of several drawings at
+        // the address the tallest, as display_transfer_on_gpu picks
+        let Some((addr, size)) = self
+            .surfaces
+            .iter()
+            .filter(|s| s.addr == t.input && s.kind == input_kind && s.tiled && s.width == t.input_width && s.dirty.is_some() && s.height < rows && rows.is_multiple_of(8) && s.height.is_multiple_of(8) && s.height.is_multiple_of(t.scale.1))
+            .max_by_key(|s| s.height)
+            .map(|s| (s.addr, (s.width, s.height)))
+        else {
             return Ok(false);
         };
         // the rows after the drawing come from memory as they are, which
