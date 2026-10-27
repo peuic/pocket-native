@@ -4256,6 +4256,9 @@ impl Gles {
             .max_by_key(|(s, _)| (s.dirty.is_some(), s.height))
             .map(|(s, row)| (s.addr, (s.width, s.height), row))
         else {
+            if self.transfer_past_drawing(memory, t)? {
+                return Ok(true);
+            }
             return self.transfer_below_memory(memory, t);
         };
         let input_end = addr as u64 + (input_size.0 * input_size.1 * input_kind.bytes()) as u64;
@@ -4308,6 +4311,104 @@ impl Gles {
             gl.bind_image_texture(1, Some(target_texture), 0, false, 0, glow::WRITE_ONLY, glow::RGBA8);
             gl.dispatch_compute(up(t.copy.0).div_ceil(8), up(t.copy.1).div_ceil(8), 1);
             gl.memory_barrier(glow::ALL_BARRIER_BITS);
+        });
+        let target = &mut self.surfaces[target];
+        target.drew((0, target.height));
+        target.screen_batch += 1;
+        self.end_batch();
+        Ok(true)
+    }
+
+    /// a display transfer whose input starts with a drawing and goes on past its end
+    /// into rows nothing drew, as Metroid: Samus Returns shrinks a 256x512
+    /// buffer it drew 400 rows of for a blur every frame: the drawing goes
+    /// through the transfer on the GPU into the first part of the output,
+    /// the rows after it from memory into the rest, rather than the drawing
+    /// being read back for the CPU, which stalled the GPU every frame.
+    fn transfer_past_drawing<M: GpuMemory>(&mut self, memory: &mut M, t: &Transfer) -> Result<bool, String> {
+        // above the console's resolution this stays with the CPU for now
+        if self.scaled() || t.flip || t.input_linear || t.column != 0 {
+            return Ok(false);
+        }
+        let (input_kind, output_kind) = (Kind::Color(t.input_format), Kind::Color(t.output_format));
+        let tile_rows = 8 * t.input_width * input_kind.bytes();
+        let rows = t.copy.1 * t.scale.1;
+        let Some((addr, size)) = self.surfaces.iter().find_map(|s| {
+            // the rows after the drawing make a tiled surface of their own,
+            // so they too have to be whole rows of tiles
+            let fits = s.addr == t.input && s.kind == input_kind && s.tiled && s.width == t.input_width && s.dirty.is_some() && s.height < rows && rows.is_multiple_of(8) && s.height.is_multiple_of(8) && s.height.is_multiple_of(t.scale.1);
+            fits.then_some((s.addr, (s.width, s.height)))
+        }) else {
+            return Ok(false);
+        };
+        // the rows after the drawing come from memory as they are, which
+        // another drawing there would make a read back again
+        let after_addr = addr + size.1 / 8 * tile_rows;
+        let after_rows = rows - size.1;
+        let after_bytes = after_rows / 8 * tile_rows;
+        if self.surfaces.iter().any(|s| s.dirty_overlaps(after_addr, after_bytes)) {
+            return Ok(false);
+        }
+        let input_end = t.input as u64 + (rows * tile_rows / 8) as u64;
+        let output_end = t.output as u64 + (t.output_width * t.output_height * output_kind.bytes()) as u64;
+        if (t.input as u64) < output_end && (t.output as u64) < input_end {
+            return Ok(false);
+        }
+        self.current()?;
+        let (drawing, after, target) = loop {
+            let drawing = self.surface_rows(memory, addr, size, input_kind, true, None)?;
+            let after = self.surface_rows(memory, after_addr, (t.input_width, after_rows), input_kind, true, None)?;
+            let target = self.surface_rows(memory, t.output, (t.output_width, t.output_height), output_kind, t.output_tiled, None)?;
+            if [drawing, after, target].iter().all(|&i| self.surfaces[i].checked) {
+                break (drawing, after, target);
+            }
+        };
+        let program = match self.transfer {
+            Some(program) => program,
+            None => {
+                let worker = self.worker.clone();
+                let program = worker.run(|| self.compute(TRANSFER_SOURCE))?;
+                self.transfer = Some(program);
+                program
+            }
+        };
+        let gl = self.gl;
+        let t = t.clone();
+        let split = size.1 / t.scale.1;
+        // each part: its source, the source's height, and the output rows
+        // it fills, from and how many
+        let parts = [
+            (self.surfaces[drawing].texture, size.1, 0, split),
+            (self.surfaces[after].texture, after_rows, split, t.copy.1 - split),
+        ];
+        let target_texture = self.surfaces[target].texture;
+        self.worker.post(move || unsafe {
+            disturb();
+            // SAFETY: on the GL thread, every texture has immutable rgba8
+            // storage and each dispatch stays inside them
+            gl.use_program(Some(program));
+            let int = |name: &str, value: i32| gl.uniform_1_i32(gl.get_uniform_location(program, name).as_ref(), value);
+            let pair = |name: &str, x: u32, y: u32| gl.uniform_2_i32(gl.get_uniform_location(program, name).as_ref(), x as i32, y as i32);
+            pair("scale", t.scale.0, t.scale.1);
+            int("input_height", t.input_height as i32);
+            int("output_height", t.output_height as i32);
+            int("flip", 0);
+            int("input_format", format_index(t.input_format));
+            int("output_format", format_index(t.output_format));
+            int("source_row", 0);
+            int("source_column", 0);
+            gl.bind_image_texture(1, Some(target_texture), 0, false, 0, glow::WRITE_ONLY, glow::RGBA8);
+            for (source, height, first, count) in parts {
+                if count == 0 {
+                    continue;
+                }
+                pair("size", t.copy.0, count);
+                int("source_height", height as i32);
+                int("target_row", first as i32);
+                gl.bind_image_texture(0, Some(source), 0, false, 0, glow::READ_ONLY, glow::RGBA8);
+                gl.dispatch_compute(t.copy.0.div_ceil(8), count.div_ceil(8), 1);
+                gl.memory_barrier(glow::ALL_BARRIER_BITS);
+            }
         });
         let target = &mut self.surfaces[target];
         target.drew((0, target.height));
