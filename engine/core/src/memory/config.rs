@@ -75,6 +75,10 @@ pub fn init_shared_page(page: &mut [u8], model: ConsoleModel, slider_3d: f32, cl
     page[0x84] = (slider_3d > 0.0) as u8; // 3D LED
     // battery, on the adapter, full and no longer charging
     page[0x85] = 1 | 5 << 2;
+    // 0x86 is undocumented, 1 on a retail console: games wait for it before
+    // reading what they run on. Luigi's Mansion 2 polls its bit 0 before doing
+    // anything else and sat on a black screen forever while it was zero
+    page[0x86] = 1;
     page[0xC0] = 0; // no headset
 }
 
