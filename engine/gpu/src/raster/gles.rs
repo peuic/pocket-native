@@ -100,6 +100,7 @@ uniform int output_format;
 uniform int source_row;
 uniform int source_column;
 uniform int target_row;
+uniform int target_column;
 uniform int source_height;
 
 uint expand(uint value, uint bits) {
@@ -141,7 +142,7 @@ void main() {
     }
     uint count = uint(scale.x * scale.y);
     uvec4 pixel = quantize((sum + count / 2u) / count, output_format);
-    imageStore(target, ivec2(at.x, output_height - 1 - (target_row + at.y)), vec4(pixel) / 255.0);
+    imageStore(target, ivec2(target_column + at.x, output_height - 1 - (target_row + at.y)), vec4(pixel) / 255.0);
 }
 "#;
 
@@ -4126,11 +4127,12 @@ impl Gles {
         Ok(copy)
     }
 
-    /// a texture copy of whole rows of tiles of a picture the GPU drew and
-    /// has not written to memory, done on the GPU as a display transfer that
-    /// keeps the layout and format: done on the CPU, the picture would have
-    /// to be read back first, which stalls the GPU every time. false leaves
-    /// it to the CPU. widths and skips are in bytes, as the copy gives them.
+    /// a texture copy out of a picture the GPU drew and has not written to
+    /// memory, whole rows of tiles of a tiled one or lines of a linear one,
+    /// done on the GPU as a display transfer that keeps the layout and
+    /// format: done on the CPU, the picture would have to be read back
+    /// first, which stalls the GPU every time. false leaves it to the CPU.
+    /// widths and skips are in bytes, as the copy gives them.
     pub(crate) fn texture_copy<M: GpuMemory>(&mut self, memory: &mut M, input: u32, output: u32, size: u32, input_lines: (u32, u32), output_lines: (u32, u32)) -> Result<bool, String> {
         let done = self.texture_copy_on_gpu(memory, input, output, size, input_lines, output_lines)?;
         if !done {
@@ -4151,6 +4153,9 @@ impl Gles {
         // above the console's resolution these stay with the CPU for now
         if size == 0 || self.scaled() {
             return Ok(false);
+        }
+        if self.linear_copy_on_gpu(memory, input, output, size, input_lines, output_lines)? {
+            return Ok(true);
         }
         let Some((addr, width, column, copy, output_width, format)) = self.surfaces.iter().find_map(|s| {
             let Kind::Color(format) = s.kind else { return None };
@@ -4238,20 +4243,29 @@ impl Gles {
         let input_kind = Kind::Color(t.input_format);
         let output_kind = Kind::Color(t.output_format);
         static CPU: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if t.input_linear || t.copy.0 == 0 || t.copy.1 == 0 || *CPU.get_or_init(|| crate::switch("ZAKURO_CPU_TRANSFERS", "display transfers on the CPU")) {
+        if t.copy.0 == 0 || t.copy.1 == 0 || *CPU.get_or_init(|| crate::switch("ZAKURO_CPU_TRANSFERS", "display transfers on the CPU")) {
+            return Ok(false);
+        }
+        // a linear input can be a drawing on the GPU too, a display
+        // transfer's output (Luigi's Mansion 2 shifts its picture through
+        // one), and may start at any of its rows; a tiled one only at a row
+        // of 8x8 tiles. above the console's resolution a linear one stays
+        // with the CPU for now: up() rounds a row that is not a multiple of 4
+        if t.input_linear && self.scaled() {
             return Ok(false);
         }
         let rows = t.copy.1 * t.scale.1;
         let first = if t.flip { t.input_height - rows } else { 0 };
-        let tile_rows = 8 * t.input_width * input_kind.bytes();
+        let unit_rows = if t.input_linear { 1 } else { 8 };
+        let unit_bytes = unit_rows * t.input_width * input_kind.bytes();
         let row_in = |s: &Surface| {
-            let offset = t.input.checked_sub(s.addr).filter(|offset| offset % tile_rows == 0)? / tile_rows * 8;
+            let offset = t.input.checked_sub(s.addr).filter(|offset| offset % unit_bytes == 0)? / unit_bytes * unit_rows;
             (offset + first + rows <= s.height).then_some(offset)
         };
         let Some((addr, input_size, row)) = self
             .surfaces
             .iter()
-            .filter(|s| s.kind == input_kind && s.tiled && s.width == t.input_width)
+            .filter(|s| s.kind == input_kind && s.tiled != t.input_linear && s.width == t.input_width && (s.tiled || s.dirty.is_some()))
             .filter_map(|s| Some((s, row_in(s)?)))
             .max_by_key(|(s, _)| (s.dirty.is_some(), s.height))
             .map(|(s, row)| (s.addr, (s.width, s.height), row))
@@ -4265,7 +4279,7 @@ impl Gles {
         }
         self.current()?;
         let (source, target) = loop {
-            let source = self.surface_rows(memory, addr, input_size, input_kind, true, None)?;
+            let source = self.surface_rows(memory, addr, input_size, input_kind, !t.input_linear, None)?;
             let target = self.surface_rows(memory, t.output, (t.output_width, t.output_height), output_kind, t.output_tiled, None)?;
             if self.surfaces[source].checked && self.surfaces[target].checked {
                 break (source, target);
@@ -4303,6 +4317,7 @@ impl Gles {
             int("source_row", up(row) as i32);
             int("source_column", up(t.column) as i32);
             int("target_row", 0);
+            int("target_column", 0);
             int("source_height", up(input_size.1) as i32);
             gl.bind_image_texture(0, Some(source_texture), 0, false, 0, glow::READ_ONLY, glow::RGBA8);
             gl.bind_image_texture(1, Some(target_texture), 0, false, 0, glow::WRITE_ONLY, glow::RGBA8);
@@ -4311,6 +4326,119 @@ impl Gles {
         });
         let target = &mut self.surfaces[target];
         target.drew((0, target.height));
+        target.screen_batch += 1;
+        self.end_batch();
+        Ok(true)
+    }
+
+    /// a texture copy of whole lines out of a linear drawing, a display
+    /// transfer's output, into a linear buffer: Luigi's Mansion 2 shifts its
+    /// picture by a few columns and assembles the top screen's framebuffer
+    /// from two halves this way, three copies a frame, each a read back of
+    /// the drawing when left to the CPU. The lines go through the transfer
+    /// program on the GPU, into their columns and rows of the output, which
+    /// stays a drawing the panel shows or a transfer reads from there.
+    fn linear_copy_on_gpu<M: GpuMemory>(&mut self, memory: &mut M, input: u32, output: u32, size: u32, (in_bytes, in_skip): (u32, u32), (out_bytes, out_skip): (u32, u32)) -> Result<bool, String> {
+        let _timed = timed(0);
+        let Some((format, bpp, x, y, w, h, source_addr, source_size)) = self.surfaces.iter().find_map(|s| {
+            let Kind::Color(format) = s.kind else { return None };
+            if s.tiled || s.stale || s.dirty.is_none() {
+                return None;
+            }
+            let (bpp, row_bytes) = (s.kind.bytes(), s.row_bytes());
+            let offset = input.checked_sub(s.addr)?;
+            // a line is part of one row, one per row, or a whole row when
+            // none is given
+            let (line, stride) = if in_bytes == 0 { (row_bytes, row_bytes) } else { (in_bytes, in_bytes + in_skip) };
+            if stride != row_bytes || !line.is_multiple_of(bpp) || line == 0 || !size.is_multiple_of(line) || !(offset % row_bytes).is_multiple_of(bpp) {
+                return None;
+            }
+            let (x, y, w, h) = (offset % row_bytes / bpp, offset / row_bytes, line / bpp, size / line);
+            (x + w <= s.width && y + h <= s.height).then_some((format, bpp, x, y, w, h, s.addr, (s.width, s.height)))
+        }) else {
+            return Ok(false);
+        };
+        let kind = Kind::Color(format);
+        let out_line = if out_bytes == 0 { w * bpp } else { out_bytes };
+        let out_stride = if out_bytes == 0 { out_line } else { out_bytes + out_skip };
+        if out_line != w * bpp || !out_stride.is_multiple_of(bpp) {
+            return Ok(false);
+        }
+        let out_width = out_stride / bpp;
+        // the buffer the output lies in: a linear drawing of this width
+        // already there with these rows, or else one from the output's row
+        // on, its rows in phase with the lowest such drawing the output
+        // starts inside and at least as tall as it (Luigi's Mansion 2
+        // assembles its top screen in halves inside one framebuffer), or
+        // from the output itself when none is there
+        let extent = (h - 1) * out_stride + out_line;
+        let (origin, height) = match self.surfaces.iter().find(|s| !s.tiled && s.kind == kind && s.width == out_width && s.addr <= output && output + extent <= s.addr + s.size()) {
+            Some(s) => (s.addr, s.height),
+            None => {
+                let anchor = self.surfaces.iter().filter(|s| !s.tiled && s.kind == kind && s.width == out_width && s.addr <= output && output < s.addr + s.size()).min_by_key(|s| s.addr);
+                let (anchor_addr, anchor_height) = anchor.map_or((output, 0), |s| (s.addr, s.height));
+                let origin = anchor_addr + (output - anchor_addr) / out_stride * out_stride;
+                let rows_needed = ((output - origin) / out_stride + h).max(anchor_height.saturating_sub((origin - anchor_addr) / out_stride));
+                (origin, rows_needed)
+            }
+        };
+        let (out_x, out_y) = ((output - origin) % out_stride / bpp, (output - origin) / out_stride);
+        if out_x + w > out_width || out_y + h > height {
+            return Ok(false);
+        }
+        // the output's buffer and the drawing read must not overlap
+        let input_end = source_addr as u64 + (source_size.0 * source_size.1 * bpp) as u64;
+        let output_end = origin as u64 + (out_width * height * bpp) as u64;
+        if (source_addr as u64) < output_end && (origin as u64) < input_end {
+            return Ok(false);
+        }
+        self.pictures += 1;
+        self.current()?;
+        let (source, target) = loop {
+            let source = self.surface_rows(memory, source_addr, source_size, kind, false, None)?;
+            let target = self.surface_rows(memory, origin, (out_width, height), kind, false, None)?;
+            if self.surfaces[source].checked && self.surfaces[target].checked {
+                break (source, target);
+            }
+        };
+        let program = match self.transfer {
+            Some(program) => program,
+            None => {
+                let worker = self.worker.clone();
+                let program = worker.run(|| self.compute(TRANSFER_SOURCE))?;
+                self.transfer = Some(program);
+                program
+            }
+        };
+        let gl = self.gl;
+        let (source_texture, target_texture) = (self.surfaces[source].texture, self.surfaces[target].texture);
+        let source_height = self.surfaces[source].height;
+        self.worker.post(move || unsafe {
+            disturb();
+            // SAFETY: on the GL thread, both textures have immutable rgba8
+            // storage and the dispatch stays inside them
+            gl.use_program(Some(program));
+            let int = |name: &str, value: i32| gl.uniform_1_i32(gl.get_uniform_location(program, name).as_ref(), value);
+            let pair = |name: &str, x: u32, y: u32| gl.uniform_2_i32(gl.get_uniform_location(program, name).as_ref(), x as i32, y as i32);
+            pair("size", w, h);
+            pair("scale", 1, 1);
+            int("input_height", h as i32);
+            int("output_height", height as i32);
+            int("flip", 0);
+            int("input_format", format_index(format));
+            int("output_format", format_index(format));
+            int("source_row", y as i32);
+            int("source_column", x as i32);
+            int("target_row", out_y as i32);
+            int("target_column", out_x as i32);
+            int("source_height", source_height as i32);
+            gl.bind_image_texture(0, Some(source_texture), 0, false, 0, glow::READ_ONLY, glow::RGBA8);
+            gl.bind_image_texture(1, Some(target_texture), 0, false, 0, glow::WRITE_ONLY, glow::RGBA8);
+            gl.dispatch_compute(w.div_ceil(8), h.div_ceil(8), 1);
+            gl.memory_barrier(glow::ALL_BARRIER_BITS);
+        });
+        let target = &mut self.surfaces[target];
+        target.drew((out_y, out_y + h));
         target.screen_batch += 1;
         self.end_batch();
         Ok(true)
@@ -4399,6 +4527,7 @@ impl Gles {
                 pair("size", t.copy.0, count);
                 int("source_height", height as i32);
                 int("target_row", first as i32);
+                int("target_column", 0);
                 gl.bind_image_texture(0, Some(source), 0, false, 0, glow::READ_ONLY, glow::RGBA8);
                 gl.dispatch_compute(t.copy.0.div_ceil(8), count.div_ceil(8), 1);
                 gl.memory_barrier(glow::ALL_BARRIER_BITS);
