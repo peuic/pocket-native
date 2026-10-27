@@ -336,7 +336,9 @@ impl Surface {
     }
 
     fn drew(&mut self, (start, end): (u32, u32)) {
-        let rows = ((start / 8 * 8).min(self.height), end.div_ceil(8).saturating_mul(8).min(self.height));
+        // whole rows of tiles of a tiled surface, any rows of a linear one
+        let unit = if self.tiled { 8 } else { 1 };
+        let rows = ((start / unit * unit).min(self.height), end.div_ceil(unit).saturating_mul(unit).min(self.height));
         self.dirty = Some(match self.dirty {
             Some((from, to)) => (from.min(rows.0), to.max(rows.1)),
             None => rows,
@@ -4372,7 +4374,13 @@ impl Gles {
         // assembles its top screen in halves inside one framebuffer), or
         // from the output itself when none is there
         let extent = (h - 1) * out_stride + out_line;
-        let (origin, height) = match self.surfaces.iter().find(|s| !s.tiled && s.kind == kind && s.width == out_width && s.addr <= output && output + extent <= s.addr + s.size()) {
+        let holding: Vec<&Surface> = self.surfaces.iter().filter(|s| !s.tiled && s.kind == kind && s.width == out_width && s.addr <= output && output + extent <= s.addr + s.size()).collect();
+        if holding.iter().filter(|s| s.dirty.is_some()).count() > 1 {
+            // two drawings claim the output: which one the game means is
+            // not for this path to guess
+            return Ok(false);
+        }
+        let (origin, height) = match holding.iter().max_by_key(|s| (s.dirty.is_some(), s.height)) {
             Some(s) => (s.addr, s.height),
             None => {
                 let anchor = self.surfaces.iter().filter(|s| !s.tiled && s.kind == kind && s.width == out_width && s.addr <= output && output < s.addr + s.size()).min_by_key(|s| s.addr);
@@ -4382,8 +4390,16 @@ impl Gles {
                 (origin, rows_needed)
             }
         };
-        let (out_x, out_y) = ((output - origin) % out_stride / bpp, (output - origin) / out_stride);
-        if out_x + w > out_width || out_y + h > height {
+        // the output starts on a pixel of that buffer, or this is not its buffer
+        let column_bytes = (output - origin) % out_stride;
+        if !column_bytes.is_multiple_of(bpp) {
+            return Ok(false);
+        }
+        let (out_x, out_y) = (column_bytes / bpp, (output - origin) / out_stride);
+        // the buffer's size comes from the copy's own numbers: no bigger than
+        // anything the console's GPU addresses
+        const MOST_SIDE: u32 = 1024;
+        if out_x + w > out_width || out_y + h > height || out_width > MOST_SIDE || height > MOST_SIDE {
             return Ok(false);
         }
         // the output's buffer and the drawing read must not overlap
